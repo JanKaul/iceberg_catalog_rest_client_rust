@@ -55,6 +55,17 @@ impl Catalog for RestCatalog {
             })
             .collect::<Result<Vec<TableIdentifier>>>()
     }
+    /// Lists all namespaces in the catalog.
+    async fn list_namespaces(&self, parent: Option<&str>) -> Result<Vec<Namespace>> {
+        let namespaces =
+            catalog_api_api::list_namespaces(&self.configuration, &self.name, parent).await?;
+        namespaces
+            .namespaces
+            .ok_or_else(|| anyhow!("No tables found"))?
+            .into_iter()
+            .map(|x| Namespace::try_new(&x))
+            .collect::<Result<Vec<Namespace>>>()
+    }
     /// Create a table from an identifier and a schema
     async fn create_table(
         self: Arc<Self>,

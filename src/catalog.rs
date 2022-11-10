@@ -109,7 +109,9 @@ impl Catalog for RestCatalog {
         )
         .await
         .map(|x| x.metadata_location)?
-        .ok_or(anyhow!("No metadata location provided."))?
+        .ok_or(anyhow!("No metadata location provided."))
+        .and_then(|y| url::Url::parse(&y).map_err(anyhow::Error::msg))?
+        .path()
         .into();
         let bytes = &self
             .object_store

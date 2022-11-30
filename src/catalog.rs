@@ -3,7 +3,12 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use iceberg_rs::{
-    catalog::{identifier::Identifier, namespace::Namespace, Catalog, Relation, RelationMetadata},
+    catalog::{
+        identifier::Identifier,
+        namespace::Namespace,
+        relation::{Relation, RelationMetadata},
+        Catalog,
+    },
     object_store::{path::Path, ObjectStore},
     table::Table,
     view::View,

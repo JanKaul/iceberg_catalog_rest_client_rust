@@ -3,10 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use iceberg_rs::{
-    catalog::{namespace::Namespace, table_identifier::TableIdentifier, Catalog},
-    model::{schema::SchemaV2, table_metadata::TableMetadata},
+    catalog::{identifier::Identifier, namespace::Namespace, Catalog, Relation, RelationMetadata},
     object_store::{path::Path, ObjectStore},
-    table::{table_builder::TableBuilder, Table},
+    table::Table,
+    view::View,
 };
 
 use crate::{
@@ -17,7 +17,6 @@ use crate::{
 pub struct RestCatalog {
     name: String,
     configuration: configuration::Configuration,
-    base_path: String,
     object_store: Arc<dyn ObjectStore>,
 }
 
@@ -25,13 +24,11 @@ impl RestCatalog {
     pub fn new(
         name: String,
         configuration: configuration::Configuration,
-        base_path: String,
         object_store: Arc<dyn ObjectStore>,
     ) -> Self {
         RestCatalog {
             name,
             configuration,
-            base_path,
             object_store,
         }
     }
@@ -40,7 +37,7 @@ impl RestCatalog {
 #[async_trait]
 impl Catalog for RestCatalog {
     /// Lists all tables in the given namespace.
-    async fn list_tables(&self, namespace: &Namespace) -> Result<Vec<TableIdentifier>> {
+    async fn list_tables(&self, namespace: &Namespace) -> Result<Vec<Identifier>> {
         let tables =
             catalog_api_api::list_tables(&self.configuration, &self.name, &namespace.to_string())
                 .await?;
@@ -51,9 +48,9 @@ impl Catalog for RestCatalog {
             .map(|x| {
                 let mut vec = x.namespace;
                 vec.push(x.name);
-                TableIdentifier::try_new(&vec)
+                Identifier::try_new(&vec)
             })
-            .collect::<Result<Vec<TableIdentifier>>>()
+            .collect::<Result<Vec<Identifier>>>()
     }
     /// Lists all namespaces in the catalog.
     async fn list_namespaces(&self, parent: Option<&str>) -> Result<Vec<Namespace>> {
@@ -66,17 +63,8 @@ impl Catalog for RestCatalog {
             .map(|x| Namespace::try_new(&x))
             .collect::<Result<Vec<Namespace>>>()
     }
-    /// Create a table from an identifier and a schema
-    async fn create_table(
-        self: Arc<Self>,
-        identifier: TableIdentifier,
-        schema: SchemaV2,
-    ) -> Result<Table> {
-        let builder = self.build_table(identifier, schema).await?;
-        builder.commit().await
-    }
     /// Check if a table exists
-    async fn table_exists(&self, identifier: &TableIdentifier) -> Result<bool> {
+    async fn table_exists(&self, identifier: &Identifier) -> Result<bool> {
         catalog_api_api::table_exists(
             &self.configuration,
             &self.name,
@@ -88,7 +76,7 @@ impl Catalog for RestCatalog {
         .map_err(anyhow::Error::msg)
     }
     /// Drop a table and delete all data and metadata files.
-    async fn drop_table(&self, identifier: &TableIdentifier) -> Result<()> {
+    async fn drop_table(&self, identifier: &Identifier) -> Result<()> {
         catalog_api_api::drop_table(
             &self.configuration,
             &self.name,
@@ -100,7 +88,7 @@ impl Catalog for RestCatalog {
         .map_err(anyhow::Error::msg)
     }
     /// Load a table.
-    async fn load_table(self: Arc<Self>, identifier: TableIdentifier) -> Result<Table> {
+    async fn load_table(self: Arc<Self>, identifier: &Identifier) -> Result<Relation> {
         let path: Path = catalog_api_api::load_table(
             &self.configuration,
             &self.name,
@@ -121,29 +109,42 @@ impl Catalog for RestCatalog {
             .bytes()
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
-        let metadata: TableMetadata = serde_json::from_str(
+        let metadata: RelationMetadata = serde_json::from_str(
             std::str::from_utf8(bytes).map_err(|err| anyhow!(err.to_string()))?,
         )
         .map_err(|err| anyhow!(err.to_string()))?;
         let catalog: Arc<dyn Catalog> = self;
-        Ok(Table::new_metastore_table(
-            identifier,
-            Arc::clone(&catalog),
-            metadata,
-            &path.to_string(),
-        )
-        .await?)
+        match metadata {
+            RelationMetadata::Table(metadata) => Ok(Relation::Table(
+                Table::new_metastore_table(
+                    identifier.clone(),
+                    Arc::clone(&catalog),
+                    metadata,
+                    &path.to_string(),
+                )
+                .await?,
+            )),
+            RelationMetadata::View(metadata) => Ok(Relation::View(
+                View::new_metastore_view(
+                    identifier.clone(),
+                    Arc::clone(&catalog),
+                    metadata,
+                    &path.to_string(),
+                )
+                .await?,
+            )),
+        }
     }
     /// Invalidate cached table metadata from current catalog.
-    async fn invalidate_table(&self, _identifier: &TableIdentifier) -> Result<()> {
+    async fn invalidate_table(&self, _identifier: &Identifier) -> Result<()> {
         unimplemented!()
     }
     /// Register a table with the catalog if it doesn't exist.
     async fn register_table(
         self: Arc<Self>,
-        identifier: TableIdentifier,
+        identifier: Identifier,
         metadata_file_location: &str,
-    ) -> Result<Table> {
+    ) -> Result<Relation> {
         let mut request = models::CreateTableRequest::new(
             identifier.name().to_owned(),
             models::Schema::default(),
@@ -156,15 +157,15 @@ impl Catalog for RestCatalog {
             Some(request),
         )
         .await?;
-        self.load_table(identifier).await
+        self.load_table(&identifier).await
     }
     /// Update a table by atomically changing the pointer to the metadata file
     async fn update_table(
         self: Arc<Self>,
-        identifier: TableIdentifier,
+        identifier: Identifier,
         metadata_file_location: &str,
         _previous_metadata_file_location: &str,
-    ) -> Result<Table> {
+    ) -> Result<Relation> {
         let mut update = models::TableUpdate::default();
         update.location = metadata_file_location.to_owned();
         let request = models::CommitTableRequest::new(vec![], vec![update]);
@@ -176,17 +177,7 @@ impl Catalog for RestCatalog {
             Some(request),
         )
         .await?;
-        self.load_table(identifier).await
-    }
-    /// Instantiate a builder to either create a table or start a create/replace transaction.
-    async fn build_table(
-        self: Arc<Self>,
-        identifier: TableIdentifier,
-        schema: SchemaV2,
-    ) -> Result<TableBuilder> {
-        let location = self.base_path.clone() + &format!("{}", identifier).replace(".", "/");
-        let catalog: Arc<dyn Catalog> = self;
-        TableBuilder::new_metastore_table(&location, schema, identifier, Arc::clone(&catalog))
+        self.load_table(&identifier).await
     }
     /// Initialize a catalog given a custom name and a map of catalog properties.
     /// A custom Catalog implementation must have a no-arg constructor. A compute engine like Spark
@@ -206,9 +197,10 @@ pub mod tests {
     use std::sync::Arc;
 
     use iceberg_rs::{
-        catalog::{table_identifier::TableIdentifier, Catalog},
+        catalog::{identifier::Identifier, Catalog},
         model::schema::{AllType, PrimitiveType, SchemaStruct, SchemaV2, StructField},
         object_store::{memory::InMemory, ObjectStore},
+        table::table_builder::TableBuilder,
     };
 
     use crate::{apis::configuration::Configuration, catalog::RestCatalog};
@@ -231,10 +223,9 @@ pub mod tests {
         let catalog: Arc<dyn Catalog> = Arc::new(RestCatalog::new(
             "my_catalog".to_owned(),
             configuration(),
-            "/".to_owned(),
             object_store,
         ));
-        let identifier = TableIdentifier::parse("load_table.table3").unwrap();
+        let identifier = Identifier::parse("load_table.table3").unwrap();
         let schema = SchemaV2 {
             schema_id: 1,
             identifier_field_ids: Some(vec![1, 2]),
@@ -258,11 +249,12 @@ pub mod tests {
                 ],
             },
         };
-
-        let mut table = Arc::clone(&catalog)
-            .create_table(identifier.clone(), schema)
-            .await
-            .expect("Failed to create table");
+        let mut table =
+            TableBuilder::new_metastore_table("/", schema, identifier.clone(), catalog.clone())
+                .expect("Failed to create table builder.")
+                .commit()
+                .await
+                .expect("Failed to create table.");
 
         let exists = Arc::clone(&catalog)
             .table_exists(&identifier)
